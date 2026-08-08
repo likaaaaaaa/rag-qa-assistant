@@ -2,7 +2,11 @@ langchain
 langchain-openai
 langchain-community
 langchain-chroma
+langchain-classic
 chromadb
 streamlit
 python-dotenv
 zhipuai
+requests
+rank_bm25
+jieba
