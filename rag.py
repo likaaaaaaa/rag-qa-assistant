@@ -30,12 +30,16 @@ class BatchedZhipuEmbeddings(ZhipuAIEmbeddings):
 
 
 embeddings = BatchedZhipuEmbeddings(model="embedding-2", api_key=API_KEY)
-llm = ChatOpenAI(model="glm-4-flash", api_key=API_KEY, base_url=BASE, temperature=0.3)
+llm = ChatOpenAI(model="glm-4-flash", api_key=API_KEY, base_url=BASE, temperature=0.3, timeout=60)
 
 PROMPT = ChatPromptTemplate.from_template(
-    """你是"AI 面试题库"问答助手。仅根据【上下文】回答用户问题；
-    若上下文没有相关信息，请明确回答"抱歉，知识库中未找到相关内容"，不要编造。
-    回答末尾用 [1][2] 标注引用来源编号。
+    """你是"AI 面试题库"问答助手，服务对象是备战 AI 应用岗面试的求职者。
+回答规范：
+1. 仅根据【上下文】回答，不凭记忆发挥、不得引入上下文之外的概念；
+2. 拒答规则：若上下文没有相关信息，或检索内容与问题无关，必须明确回答"抱歉，知识库中未找到相关内容"，绝不编造，不得根据上下文中的比喻、例子推断出答案；
+3. 回答结构：先一句话直接给结论，再分要点展开，语言通俗、层次清晰；
+4. 引用规则：回答末尾必须用 [1][2] 标注引用来源编号并注明来源文件名（格式如 [1](kb_05-prompt工程.txt)），只要回答内容来自上下文就必须附引用清单，不得省略；
+5. 讲解原则：涉及原理/对比的问题，用大白话解释"为什么"，帮用户真正理解而非背诵。
 
 【上下文】
 {context}
@@ -48,7 +52,8 @@ PROMPT = ChatPromptTemplate.from_template(
 def format_docs(docs):
     out = []
     for i, d in enumerate(docs, 1):
-        out.append(f"[{i}] 来源：{d.metadata.get('source','未知')}\n{d.page_content}")
+        src = os.path.basename(d.metadata.get('source', '未知'))
+        out.append(f"[{i}] 来源：{src}\n{d.page_content}")
     return "\n\n".join(out)
 
 

@@ -47,7 +47,7 @@ API_KEY = os.getenv("ZHIPU_API_KEY")
 BASE = "https://open.bigmodel.cn/api/paas/v4"
 
 # ② 裁判模型（智谱当评委）——注意 temperature=0，打分要稳定
-judge_llm = ChatOpenAI(model="glm-4-flash", api_key=API_KEY, base_url=BASE, temperature=0)
+judge_llm = ChatOpenAI(model="glm-4-flash", api_key=API_KEY, base_url=BASE, temperature=0, timeout=60)
 llm_wrapper = LangchainLLMWrapper(judge_llm)
 emb_wrapper = LangchainEmbeddingsWrapper(
     ZhipuAIEmbeddings(model="embedding-2", api_key=API_KEY)
@@ -78,16 +78,20 @@ chain = build_chain(mode=MODE)
 samples = []
 for item in TEST_SET:
     q = item["question"]
-    docs = retrieve_docs(q, mode=MODE)
-    contexts = [d.page_content for d in docs]
-    answer = chain.invoke(q)
+    try:
+        docs = retrieve_docs(q, mode=MODE)
+        contexts = [d.page_content for d in docs]
+        answer = chain.invoke(q)
+    except Exception as e:
+        print(f"✗ 问答失败({q[:20]}): {e!r}", flush=True)
+        docs, contexts, answer = [], [], ""
     samples.append(SingleTurnSample(
         user_input=q,
         retrieved_contexts=contexts,
         response=answer,
         reference=item["reference"],
     ))
-    print(f"✓ {q[:20]}...")
+    print(f"✓ {q[:20]}...", flush=True)
 
 # ⑦ 手写打分循环：逐样本、逐指标调用（绕开 ragas 的异步 Executor，
 #    规避 Python 3.14 的 asyncio 兼容问题）。串行执行，56 次调用，耐心等几分钟。
