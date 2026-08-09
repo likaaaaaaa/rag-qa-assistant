@@ -38,7 +38,7 @@ PROMPT = ChatPromptTemplate.from_template(
 1. 仅根据【上下文】回答，不凭记忆发挥、不得引入上下文之外的概念；
 2. 拒答规则：若上下文没有相关信息，或检索内容与问题无关，必须明确回答"抱歉，知识库中未找到相关内容"，绝不编造，不得根据上下文中的比喻、例子推断出答案；
 3. 回答结构：先一句话直接给结论，再分要点展开，语言通俗、层次清晰；
-4. 引用规则：回答末尾必须用 [1][2] 标注引用来源编号并注明来源文件名（格式如 [1](kb_05-prompt工程.txt)），只要回答内容来自上下文就必须附引用清单，不得省略；
+4. 引用规则：回答末尾用 [1][2] 标注引用来源编号，并在编号后写来源文件名，格式如" [1] 来源：kb_05-prompt工程.txt"（纯文本，禁止使用 [1](链接) 这类 Markdown 链接写法），只要回答内容来自上下文就必须附引用清单；
 5. 讲解原则：涉及原理/对比的问题，用大白话解释"为什么"，帮用户真正理解而非背诵。
 
 【上下文】
@@ -155,6 +155,15 @@ def build_chain(mode="vector"):
     return (
         {"context": ctx_provider, "question": RunnablePassthrough()}
         | PROMPT | llm | StrOutputParser()
+    )
+
+
+def generate_from_docs(query, docs):
+    """用已检索到的 docs 直接生成回答（不重复检索）。
+    供 UI 分步展示：先检索(显示耗时) → 再用结果生成(显示耗时)。"""
+    context = format_docs(docs)
+    return (PROMPT | llm | StrOutputParser()).invoke(
+        {"context": context, "question": query}
     )
 
 
