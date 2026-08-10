@@ -34,14 +34,16 @@ parser.add_argument("--mode", default="vector",
                     choices=["vector", "hybrid", "hybrid_rerank"],
                     help="vector=纯向量基线 / hybrid=混合检索 / hybrid_rerank=混合检索+Rerank")
 parser.add_argument("--output", default=None, help="输出 CSV 文件名（默认按模式命名）")
+parser.add_argument("--rewrite", action="store_true", help="开启 Query 改写（用于对比改写前后效果）")
 args = parser.parse_args()
 MODE = args.mode
+REWRITE = args.rewrite
 OUTPUT = args.output or {
     "vector": "评测基线_纯向量.csv",
     "hybrid": "评测基线_混合检索.csv",
     "hybrid_rerank": "评测基线_混合检索+Rerank.csv",
 }[MODE]
-print(f"检索模式：{MODE} → 输出：{OUTPUT}")
+print(f"检索模式：{MODE} | Query 改写：{'开' if REWRITE else '关'} → 输出：{OUTPUT}")
 
 API_KEY = os.getenv("ZHIPU_API_KEY")
 BASE = "https://open.bigmodel.cn/api/paas/v4"
@@ -72,14 +74,14 @@ except ImportError:
     print("ℹ 本版本无检索精确度指标，先跑 3 个核心指标")
 
 # ⑤ 加载系统：链与检索器都用同一个 mode（保证 answer 基于同一批上下文）
-chain = build_chain(mode=MODE)
+chain = build_chain(mode=MODE, rewrite=REWRITE)
 
 # ⑥ 跑系统：对每个问题拿到 检索上下文 + 系统回答
 samples = []
 for item in TEST_SET:
     q = item["question"]
     try:
-        docs = retrieve_docs(q, mode=MODE)
+        docs = retrieve_docs(q, mode=MODE, rewrite=REWRITE)
         contexts = [d.page_content for d in docs]
         answer = chain.invoke(q)
     except Exception as e:

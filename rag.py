@@ -1,4 +1,5 @@
 import os
+import re
 import requests
 import jieba
 from dotenv import load_dotenv
@@ -47,6 +48,57 @@ PROMPT = ChatPromptTemplate.from_template(
 【问题】{question}
 【回答】"""
 )
+
+# Query 改写：口语问题先转成检索友好的问法，再走检索
+# 改写失败/超时直接回落原 query，不阻塞主流程
+REWRITE_PROMPT = ChatPromptTemplate.from_template(
+    """你是"AI 面试题库"的检索查询改写器，把用户的口语化提问改写成适合检索的规范问法。
+规则：
+1. 只改写表达方式，不增删信息、不编造、不回答问题；
+2. 清理口语和废话："咋"→"如何"、"帮我看下""我想问一下"这类前缀去掉；
+3. 保留核心概念与专业术语，可补全省略的主语，但不引入上下文之外的概念；
+4. 只输出改写后的一句话问法，不要解释、不要引号。
+
+【问题】{question}
+【改写结果】"""
+)
+_rewrite_chain = None
+
+
+def rewrite_query(query):
+    """口语 query → 检索友好问法；失败回落原 query"""
+    global _rewrite_chain
+    if _rewrite_chain is None:
+        _rewrite_chain = REWRITE_PROMPT | llm | StrOutputParser()
+    try:
+        rewritten = _rewrite_chain.invoke(query).strip().strip('"').strip('“”')
+        return rewritten if rewritten and rewritten != query else query
+    except Exception:
+        return query
+
+
+def clean_citations(text, docs):
+    """引用兜底两件事:
+    1) 把 [N](链接) 洗成 [N] 来源:文件名(基于实际检索结果,不信任模型写的链接);
+    2) 给裸的 [N] 补上来源文件名(编号顺序 = docs 顺序),带尾空格分隔。"""
+    def src_of(idx):
+        if 1 <= idx <= len(docs):
+            return os.path.basename(docs[idx - 1].metadata.get('source', '未知'))
+        return None
+
+    def repl_link(m):
+        idx = int(m.group(1))
+        s = src_of(idx)
+        return f"[{idx}] 来源:{s}" if s else m.group(0)
+
+    text = re.sub(r"\[(\d+)\]\(([^)]+)\)", repl_link, text)
+
+    def repl_plain(m):
+        idx = int(m.group(1))
+        s = src_of(idx)
+        return f"[{idx}] 来源:{s} " if s else m.group(0)
+
+    return re.sub(r"\[(\d+)\](?!\s*来源[:：])", repl_plain, text)
 
 
 def format_docs(docs):
@@ -130,8 +182,10 @@ def zhipu_rerank(query, docs, top_n=3):
     return [docs[r["index"]] for r in data["results"]]
 
 
-def retrieve_docs(query, mode="vector"):
+def retrieve_docs(query, mode="vector", rewrite=False):
     """统一的文档检索入口：返回按相关度排序的 list[Document]"""
+    if rewrite:
+        query = rewrite_query(query)
     if mode == "vector":
         return _get_vs().as_retriever(search_kwargs={"k": 3}).invoke(query)
     candidates = _get_ensemble().invoke(query)  # 混合检索全部候选
@@ -142,15 +196,19 @@ def retrieve_docs(query, mode="vector"):
     raise ValueError(f"未知检索模式: {mode}")
 
 
-def build_chain(mode="vector"):
+def build_chain(mode="vector", rewrite=False):
     """构建问答链。默认 vector：与原版行为完全一致（线上部署零影响）。
-    非 vector 模式：上下文改用对应模式的检索结果。"""
+    rewrite=True 时先改写 query 再检索，只影响检索，不影响生成的问题原文。"""
     if mode == "vector":
         retriever = _get_vs().as_retriever(search_kwargs={"k": 3})
-        ctx_provider = retriever | format_docs
+
+        def ctx_provider(q):
+            rq = rewrite_query(q) if rewrite else q
+            return format_docs(retriever.invoke(rq))
     else:
         def ctx_provider(q):
-            return format_docs(retrieve_docs(q, mode=mode))
+            rq = rewrite_query(q) if rewrite else q
+            return format_docs(retrieve_docs(rq, mode=mode))
 
     return (
         {"context": ctx_provider, "question": RunnablePassthrough()}
@@ -170,9 +228,18 @@ def generate_from_docs(query, docs):
 if __name__ == "__main__":
     import sys
     mode = sys.argv[1] if len(sys.argv) > 1 else "vector"
-    print(f"检索模式：{mode}")
-    chain = build_chain(mode=mode)
+    rewrite = "--rewrite" in sys.argv
+    print(f"检索模式：{mode} | Query 改写：{'开' if rewrite else '关'}")
+    if rewrite:
+        print("（改写模式：输入问题后，'改写：'一行会显示口语→规范问法的转换效果）")
     while True:
         q = input("\n你：")
-        if q in ("exit", "quit"): break
-        print("助手：", chain.invoke(q))
+        if q in ("exit", "quit"):
+            break
+        if rewrite:
+            rq = rewrite_query(q)
+            print(f"改写：{q} → {rq}")
+            docs = retrieve_docs(rq, mode=mode)
+        else:
+            docs = retrieve_docs(q, mode=mode)
+        print("助手：", clean_citations(generate_from_docs(q, docs), docs))

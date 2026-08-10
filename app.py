@@ -1,32 +1,7 @@
 import os
 import time
-import re
 import streamlit as st
-from rag import retrieve_docs, generate_from_docs
-
-
-def clean_citations(text, docs):
-    """引用兜底两件事:
-    1) 把 [N](链接) 洗成 [N] 来源:文件名(基于实际检索结果,不信任模型写的链接);
-    2) 给裸的 [N] 补上来源文件名(编号顺序 = docs 顺序),带尾空格分隔。"""
-    def src_of(idx):
-        if 1 <= idx <= len(docs):
-            return os.path.basename(docs[idx - 1].metadata.get('source', '未知'))
-        return None
-
-    def repl_link(m):
-        idx = int(m.group(1))
-        s = src_of(idx)
-        return f"[{idx}] 来源:{s}" if s else m.group(0)
-
-    text = re.sub(r"\[(\d+)\]\(([^)]+)\)", repl_link, text)
-
-    def repl_plain(m):
-        idx = int(m.group(1))
-        s = src_of(idx)
-        return f"[{idx}] 来源:{s} " if s else m.group(0)
-
-    return re.sub(r"\[(\d+)\](?!\s*来源[:：])", repl_plain, text)
+from rag import retrieve_docs, generate_from_docs, rewrite_query, clean_citations
 
 
 st.set_page_config(page_title="AI 面试题库 · RAG 智能问答", page_icon="🤖")
@@ -63,14 +38,17 @@ if q := st.chat_input("输入你的问题…"):
         with st.chat_message("assistant"):
             with st.spinner("思考中…"):
                 t0 = time.time()
-                docs = retrieve_docs(q, mode=mode)
-                t_retrieve = time.time() - t0
+                rq = rewrite_query(q)  # 口语问题先改写，检索用改写后的
+                t_rewrite = time.time() - t0
                 t1 = time.time()
-                ans = generate_from_docs(q, docs)
-                t_generate = time.time() - t1
+                docs = retrieve_docs(rq, mode=mode)
+                t_retrieve = time.time() - t1
+                t2 = time.time()
+                ans = generate_from_docs(q, docs)  # 生成仍用原问题，不改用户意图
+                t_generate = time.time() - t2
 
     ans = clean_citations(ans, docs)
-    head = f"⚡ 检索 {t_retrieve:.1f}s · 生成 {t_generate:.1f}s"
+    head = f"⚡ 改写 {t_rewrite:.1f}s · 检索 {t_retrieve:.1f}s · 生成 {t_generate:.1f}s"
     full = f"{head}\n\n{ans}"
 
     # 写入历史 → 清空占位容器 → rerun 统一重建(消除灰影)
