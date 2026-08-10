@@ -49,30 +49,61 @@ PROMPT = ChatPromptTemplate.from_template(
 【回答】"""
 )
 
-# Query 改写：口语问题先转成检索友好的问法，再走检索
-# 改写失败/超时直接回落原 query，不阻塞主流程
+# Query 改写：只对明显口语的问题改写，规范问法直接跳过（防止检索被无谓改写干扰）
+# 改写失败/丢失核心词/超时 → 回落原 query，不阻塞主流程
 REWRITE_PROMPT = ChatPromptTemplate.from_template(
     """你是"AI 面试题库"的检索查询改写器，把用户的口语化提问改写成适合检索的规范问法。
 规则：
 1. 只改写表达方式，不增删信息、不编造、不回答问题；
 2. 清理口语和废话："咋"→"如何"、"帮我看下""我想问一下"这类前缀去掉；
-3. 保留核心概念与专业术语，可补全省略的主语，但不引入上下文之外的概念；
-4. 只输出改写后的一句话问法，不要解释、不要引号。
+3. 保留原问题的核心名词和关键概念，不得替换或丢掉（硬性要求）；
+4. 可补全省略的主语，但不引入上下文之外的概念；
+5. 只输出改写后的一句话问法，不要解释、不要引号。
 
 【问题】{question}
 【改写结果】"""
 )
+
+# 口语特征词：命中才需要改写（规范问法不改，防止检索被无谓改写干扰）
+SPOKEN = ["咋", "啥", "嘛", "呗", "帮我看", "帮我看看", "是不是", "能不能",
+          "会不会", "有没有", "到底", "咋样", "咋回事", "行吗"]
+# 提取核心词时的停用词（口语词/虚词/弱词）
+_STOP = {"什么", "怎么", "如何", "是", "的", "了", "吗", "呢", "啊", "咋", "啥",
+         "让", "把", "那个", "这个", "一下", "请问", "帮我", "看下", "到底",
+         "是不是", "能不能", "会不会", "有没有", "咋样", "咋回事", "咋搞", "咋弄",
+         "咋实现", "咋知道", "咋让", "咋写", "咋存", "咋记", "行吗",
+         "的话", "之前", "之后", "它", "他", "她", "这", "那", "点", "会", "要"}
 _rewrite_chain = None
 
 
+def is_spoken_query(query):
+    """是否口语问法：命中口语特征词才需要改写"""
+    return any(w in query for w in SPOKEN)
+
+
+def _core_terms(query):
+    """提取 query 的核心实词（jieba 分词后过滤停用词）"""
+    return [t.strip() for t in jieba.cut(query)
+            if len(t.strip()) >= 2 and t.strip() not in _STOP]
+
+
 def rewrite_query(query):
-    """口语 query → 检索友好问法；失败回落原 query"""
+    """口语 query → 检索友好问法。
+    规范问法直接跳过；改写失败/丢失核心词/超时 → 回落原 query"""
+    if not is_spoken_query(query):
+        return query
     global _rewrite_chain
     if _rewrite_chain is None:
         _rewrite_chain = REWRITE_PROMPT | llm | StrOutputParser()
     try:
         rewritten = _rewrite_chain.invoke(query).strip().strip('"').strip('“”')
-        return rewritten if rewritten and rewritten != query else query
+        if not rewritten or rewritten == query:
+            return query
+        # 核心词校验：改写结果必须保留原 query 的核心实词，丢了说明改跑偏
+        core = _core_terms(query)
+        if core and not any(c in rewritten for c in core):
+            return query
+        return rewritten
     except Exception:
         return query
 
@@ -238,7 +269,7 @@ if __name__ == "__main__":
             break
         if rewrite:
             rq = rewrite_query(q)
-            print(f"改写：{q} → {rq}")
+            print(f"改写：{q} → {rq}" if rq != q else f"（{q[:12]}… 未改写：规范问法或改写回落）")
             docs = retrieve_docs(rq, mode=mode)
         else:
             docs = retrieve_docs(q, mode=mode)
