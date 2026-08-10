@@ -35,9 +35,14 @@ parser.add_argument("--mode", default="vector",
                     help="vector=纯向量基线 / hybrid=混合检索 / hybrid_rerank=混合检索+Rerank")
 parser.add_argument("--output", default=None, help="输出 CSV 文件名（默认按模式命名）")
 parser.add_argument("--rewrite", action="store_true", help="开启 Query 改写（用于对比改写前后效果）")
+parser.add_argument("--subset", default="all", choices=["all", "e"],
+                    help="all=全部39题 / e=仅E类口语化9题（省 API 用量）")
 args = parser.parse_args()
 MODE = args.mode
 REWRITE = args.rewrite
+if args.subset == "e":
+    TEST_SET = TEST_SET[-9:]
+    print(f"⚠ 子集模式：仅 E 类口语化题 {len(TEST_SET)} 题（省 API 用量）")
 OUTPUT = args.output or {
     "vector": "评测基线_纯向量.csv",
     "hybrid": "评测基线_混合检索.csv",

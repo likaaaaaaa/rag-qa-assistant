@@ -1,5 +1,6 @@
 import os
 import re
+import json
 import requests
 import jieba
 from dotenv import load_dotenv
@@ -36,10 +37,10 @@ llm = ChatOpenAI(model="glm-4-flash", api_key=API_KEY, base_url=BASE, temperatur
 PROMPT = ChatPromptTemplate.from_template(
     """你是"AI 面试题库"问答助手，服务对象是备战 AI 应用岗面试的求职者。
 回答规范：
-1. 仅根据【上下文】回答，不凭记忆发挥、不得引入上下文之外的概念；
+1. 仅根据【上下文】回答。若上下文信息不足，必须明确回答"抱歉，知识库中未找到相关内容"，宁可拒答也绝不凭记忆补全、编造或引入上下文之外的概念（这是最重要的一条）；
 2. 拒答规则：若上下文没有相关信息，或检索内容与问题无关，必须明确回答"抱歉，知识库中未找到相关内容"，绝不编造，不得根据上下文中的比喻、例子推断出答案；
 3. 回答结构：先一句话直接给结论，再分要点展开，语言通俗、层次清晰；
-4. 引用规则：回答末尾用 [1][2] 标注引用来源编号，并在编号后写来源文件名，格式如" [1] 来源：kb_05-prompt工程.txt"（纯文本，禁止使用 [1](链接) 这类 Markdown 链接写法），只要回答内容来自上下文就必须附引用清单；
+4. 引用规则（强制）：任何取自【上下文】的句子必须在末尾用 [N] 标注引用编号（N 对应【上下文】第 N 段），多条用 [1][2] 顺序编号，不必在编号后写文件名（引用区由代码补全）；未标注视为该句无依据、应拒答；
 5. 讲解原则：涉及原理/对比的问题，用大白话解释"为什么"，帮用户真正理解而非背诵；
 6. 【对话历史】仅用于理解前文语境（如"它"指什么），回答内容必须以【上下文】检索资料为准，不得把历史对话当作事实来源引用。
 
@@ -172,6 +173,119 @@ def resolve_with_history(query, history):
         return query
 
 
+def process_citations(text, docs):
+    """引用后处理：
+    ① 把 [N](链接) 洗成纯文本 [N]（不信任模型写的链接）；
+    ② 按首次出现顺序把 docs 引用重映射为连续编号 [1][2][3]（正文不跳号）；
+    ③ 返回 (新文本, citations{新编号: {source, snippet}})，供 UI 渲染可点击跳转的引用区。
+    若文本无任何引用，citations 为空。"""
+    if not text:
+        return text, {}
+
+    def src_of(idx):
+        if 1 <= idx <= len(docs):
+            return os.path.basename(docs[idx - 1].metadata.get('source', '未知'))
+        return None
+
+    # ① 洗掉模型编的链接：[N](xxx) → [N]
+    text = re.sub(r"\[(\d+)\]\([^)]*\)", lambda m: f"[{m.group(1)}]", text)
+
+    # ② 重映射：按 docs 引用首次出现顺序编号
+    order = {}          # docs索引 -> 新编号
+    counter = [0]
+
+    def repl(m):
+        idx = int(m.group(1))
+        if not (1 <= idx <= len(docs)):
+            return m.group(0)
+        if idx not in order:
+            counter[0] += 1
+            order[idx] = counter[0]
+        return f"[{order[idx]}]"
+
+    new_text = re.sub(r"\[(\d+)\]", repl, text)
+
+    # ③ 构造引用映射：新编号 -> 来源文件 + 段落预览
+    citations = {}
+    for idx, num in order.items():
+        d = docs[idx - 1]
+        citations[num] = {
+            "source": os.path.basename(d.metadata.get('source', '未知')),
+            "snippet": d.page_content,
+        }
+
+    # ④ 兜底：回答非空但 0 引用（非拒答文案）→ 自动挂第一条 docs 为 [1]，避免"无引用空文"
+    if new_text.strip() and not citations and docs:
+        if not any(kw in new_text for kw in ["抱歉", "未找到"]):
+            first = docs[0]
+            citations[1] = {
+                "source": os.path.basename(first.metadata.get('source', '未知')),
+                "snippet": first.page_content,
+            }
+            new_text = new_text.rstrip() + " [1]"
+
+    return new_text, citations
+
+
+# ============ 回答自检（可验证 RAG）：代码拆句 + 模型逐句标依据，引用编号保留 ============
+CHECK_PROMPT = ChatPromptTemplate.from_template(
+    """你是事实核查员。下面是按句拆分的 AI 回答（每句带编号），以及它依据的检索资料。
+请逐句判断每句是否能从【检索资料】中找到依据，输出每句的编号和判断。
+输出严格 JSON，格式如下：
+{{"verdicts": [{{"index": 0, "supported": true}}, {{"index": 1, "supported": false}}, ...]}}
+判断规则：
+1. 编号句子里出现 [N] 这样的引用标记时，它是引用编号不是内容，验证内容时忽略它；
+2. supported=true：该句内容（含同义改写）能在资料中找到依据，或由有依据的句子直接推出；
+3. supported=false：该句是资料里没有的（凭记忆补全、编造、过度推断）；
+4. 只判断，不要改写句子；verdicts 按原编号顺序输出，不要省略。
+
+【检索资料】
+{context}
+
+【编号句子】
+{sentences}"""
+)
+_check_chain = None
+
+
+def self_check(answer, docs):
+    """生成后自检：代码拆句 + 模型逐句标 supported，按原句拼接（引用编号 100% 保留）。
+    无依据句子丢弃；失败时原样返回（自检是增强不是依赖）。返回 (新回答, 丢弃句数)。"""
+    if not answer or not docs:
+        return answer, 0
+    sentences = [s.strip() for s in re.split(r'(?<=[。！？；\n])', answer) if s.strip()]
+    if not sentences:
+        return answer, 0
+    global _check_chain
+    if _check_chain is None:
+        _check_chain = CHECK_PROMPT | llm | StrOutputParser()
+    try:
+        numbered = "\n".join(f"{i}. {s}" for i, s in enumerate(sentences))
+        out = _check_chain.invoke(
+            {"context": format_docs(docs), "sentences": numbered}
+        ).strip()
+        if out.startswith("```"):  # 去掉模型可能带的代码块包裹
+            out = out.split("```")[1]
+            if out.startswith("json"):
+                out = out[4:]
+        data = json.loads(out)
+        verdicts = data.get("verdicts", [])
+        if not verdicts:
+            return answer, 0
+        supported = {v["index"] for v in verdicts
+                     if v.get("supported") and 0 <= v["index"] < len(sentences)}
+        if not supported:
+            return "抱歉，知识库中未找到足够信息支撑回答。", len(sentences)
+        kept = [sentences[i] for i in range(len(sentences)) if i in supported]
+        new_answer = "".join(kept)
+        dropped = len(sentences) - len(supported)
+        if dropped > 0:
+            new_answer += f"\n\n> （已自动移除 {dropped} 句无依据内容）"
+        return new_answer, dropped
+    except Exception:
+        return answer, 0
+
+
 def clean_citations(text, docs):
     """引用兜底两件事:
     1) 把 [N](链接) 洗成 [N] 来源:文件名(基于实际检索结果,不信任模型写的链接);
@@ -288,13 +402,13 @@ def retrieve_docs(query, mode="vector", rewrite=False):
         if rq != query:
             merged = _dedup(_get_ensemble().invoke(rq) + _get_ensemble().invoke(query))
             if mode == "hybrid":
-                return merged[:3]
-            return zhipu_rerank(query, merged, top_n=3)
+                return merged[:5]
+            return zhipu_rerank(query, merged, top_n=5)
     candidates = _get_ensemble().invoke(query)
     if mode == "hybrid":
-        return candidates[:3]                    # RRF 融合后取 top-3
+        return candidates[:5]                    # RRF 融合后取 top-5
     if mode == "hybrid_rerank":
-        return zhipu_rerank(query, candidates, top_n=3)
+        return zhipu_rerank(query, candidates, top_n=5)
     raise ValueError(f"未知检索模式: {mode}")
 
 
@@ -351,7 +465,16 @@ if __name__ == "__main__":
         if rq != q:
             print(f"消解：{q} → {rq}")
         docs = retrieve_docs(rq, mode=mode)
-        ans = clean_citations(generate_from_docs(q, docs, history=history), docs)
+        ans_raw = generate_from_docs(q, docs, history=history)
+        ans_raw, dropped = self_check(ans_raw, docs)
+        ans, cites = process_citations(ans_raw, docs)
+        if dropped:
+            print(f"（自检移除 {dropped} 句无依据内容）")
         print("助手：", ans)
+        if cites:
+            print("引用来源：")
+            for num in sorted(cites):
+                print(f"  [{num}] {cites[num]['source']}")
+                print(f"      {cites[num]['snippet'][:80]}…")
         history.append(("user", q))
         history.append(("assistant", ans))
