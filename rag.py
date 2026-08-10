@@ -40,7 +40,11 @@ PROMPT = ChatPromptTemplate.from_template(
 2. 拒答规则：若上下文没有相关信息，或检索内容与问题无关，必须明确回答"抱歉，知识库中未找到相关内容"，绝不编造，不得根据上下文中的比喻、例子推断出答案；
 3. 回答结构：先一句话直接给结论，再分要点展开，语言通俗、层次清晰；
 4. 引用规则：回答末尾用 [1][2] 标注引用来源编号，并在编号后写来源文件名，格式如" [1] 来源：kb_05-prompt工程.txt"（纯文本，禁止使用 [1](链接) 这类 Markdown 链接写法），只要回答内容来自上下文就必须附引用清单；
-5. 讲解原则：涉及原理/对比的问题，用大白话解释"为什么"，帮用户真正理解而非背诵。
+5. 讲解原则：涉及原理/对比的问题，用大白话解释"为什么"，帮用户真正理解而非背诵；
+6. 【对话历史】仅用于理解前文语境（如"它"指什么），回答内容必须以【上下文】检索资料为准，不得把历史对话当作事实来源引用。
+
+【对话历史】
+{history}
 
 【上下文】
 {context}
@@ -104,6 +108,66 @@ def rewrite_query(query):
         if core and not any(c in rewritten for c in core):
             return query
         return rewritten
+    except Exception:
+        return query
+
+
+# ============ 多轮对话记忆：检索前消解指代/省略，生成时注入历史 ============
+HISTORY_PROMPT = ChatPromptTemplate.from_template(
+    """你是对话历史理解器。根据对话历史，把当前用户问题补全成一条"独立可检索的完整问法"。
+规则：
+1. 当前问题里有指代（它/这个/那个/这些/那些/它们/这/那）或省略主语时，从历史中找出所指的具体概念并替换补全；
+2. 历史中没有对应信息，或当前问题本身完整时，原样输出当前问题；
+3. 不增删当前问题的核心意图，不编造历史里没有的信息；
+4. 只输出补全后的一句话，不要解释、不要引号。
+
+【对话历史】
+{history}
+
+【当前问题】{question}
+【补全结果】"""
+)
+
+# 指代词：命中或短问题才需要消解（防误伤长规范问题）
+PRONOUNS = ["它", "这个", "那个", "这些", "那些", "它们", "这", "那"]
+_resolve_chain = None
+
+
+def need_resolve(query, history):
+    """是否需要多轮消解：有历史 + (短问题 或 含指代词)"""
+    if not history:
+        return False
+    return len(query) <= 12 or any(p in query for p in PRONOUNS)
+
+
+def format_history(history, max_rounds=4, max_chars=150):
+    """把最近 max_rounds 轮对话拼成历史文本，每条消息截断到 max_chars"""
+    lines = []
+    for role, text in history[-max_rounds * 2:]:
+        t = text if len(text) <= max_chars else text[:max_chars] + "…"
+        prefix = "用户" if role == "user" else "助手"
+        lines.append(f"{prefix}：{t}")
+    return "\n".join(lines)
+
+
+def resolve_with_history(query, history):
+    """带历史的多轮消解：补全指代/省略为完整问法；失败/丢核心词回落原 query"""
+    if not need_resolve(query, history):
+        return query
+    global _resolve_chain
+    if _resolve_chain is None:
+        _resolve_chain = HISTORY_PROMPT | llm | StrOutputParser()
+    try:
+        resolved = _resolve_chain.invoke(
+            {"history": format_history(history), "question": query}
+        ).strip().strip('"').strip('“”')
+        if not resolved or resolved == query:
+            return query
+        # 核心词校验：消解结果必须保留当前问题的核心词，防消解跑偏
+        core = _core_terms(query)
+        if core and not any(c in resolved for c in core):
+            return query
+        return resolved
     except Exception:
         return query
 
@@ -214,12 +278,19 @@ def zhipu_rerank(query, docs, top_n=3):
 
 
 def retrieve_docs(query, mode="vector", rewrite=False):
-    """统一的文档检索入口：返回按相关度排序的 list[Document]"""
-    if rewrite:
-        query = rewrite_query(query)
+    """统一的文档检索入口：返回按相关度排序的 list[Document]。
+    rewrite=True：口语 query 改写后与原 query 双路召回、合并去重，再统一精排
+    （改写只负责扩召回，排序由 rerank 用原 query 决定，防止改写跑偏丢掉正确结果）"""
     if mode == "vector":
         return _get_vs().as_retriever(search_kwargs={"k": 3}).invoke(query)
-    candidates = _get_ensemble().invoke(query)  # 混合检索全部候选
+    if rewrite:
+        rq = rewrite_query(query)
+        if rq != query:
+            merged = _dedup(_get_ensemble().invoke(rq) + _get_ensemble().invoke(query))
+            if mode == "hybrid":
+                return merged[:3]
+            return zhipu_rerank(query, merged, top_n=3)
+    candidates = _get_ensemble().invoke(query)
     if mode == "hybrid":
         return candidates[:3]                    # RRF 融合后取 top-3
     if mode == "hybrid_rerank":
@@ -227,9 +298,20 @@ def retrieve_docs(query, mode="vector", rewrite=False):
     raise ValueError(f"未知检索模式: {mode}")
 
 
+def _dedup(docs):
+    """按内容前缀去重（合并两路召回时用）"""
+    seen, out = set(), []
+    for d in docs:
+        key = d.page_content[:80]
+        if key not in seen:
+            seen.add(key)
+            out.append(d)
+    return out
+
+
 def build_chain(mode="vector", rewrite=False):
     """构建问答链。默认 vector：与原版行为完全一致（线上部署零影响）。
-    rewrite=True 时先改写 query 再检索，只影响检索，不影响生成的问题原文。"""
+    rewrite=True 时检索前做 Query 改写（双路召回，只影响检索，不影响生成的问题原文）。"""
     if mode == "vector":
         retriever = _get_vs().as_retriever(search_kwargs={"k": 3})
 
@@ -238,39 +320,38 @@ def build_chain(mode="vector", rewrite=False):
             return format_docs(retriever.invoke(rq))
     else:
         def ctx_provider(q):
-            rq = rewrite_query(q) if rewrite else q
-            return format_docs(retrieve_docs(rq, mode=mode))
+            return format_docs(retrieve_docs(q, mode=mode, rewrite=rewrite))
 
     return (
-        {"context": ctx_provider, "question": RunnablePassthrough()}
+        {"context": ctx_provider, "question": RunnablePassthrough(), "history": lambda _: ""}
         | PROMPT | llm | StrOutputParser()
     )
 
 
-def generate_from_docs(query, docs):
+def generate_from_docs(query, docs, history=None):
     """用已检索到的 docs 直接生成回答（不重复检索）。
-    供 UI 分步展示：先检索(显示耗时) → 再用结果生成(显示耗时)。"""
+    history：最近对话列表，注入生成以保持连贯（回答仍以检索资料为准）。"""
     context = format_docs(docs)
+    hist = format_history(history) if history else ""
     return (PROMPT | llm | StrOutputParser()).invoke(
-        {"context": context, "question": query}
+        {"context": context, "question": query, "history": hist}
     )
 
 
 if __name__ == "__main__":
     import sys
     mode = sys.argv[1] if len(sys.argv) > 1 else "vector"
-    rewrite = "--rewrite" in sys.argv
-    print(f"检索模式：{mode} | Query 改写：{'开' if rewrite else '关'}")
-    if rewrite:
-        print("（改写模式：输入问题后，'改写：'一行会显示口语→规范问法的转换效果）")
+    print(f"检索模式：{mode} | 多轮记忆：开（输入问题前会先做指代消解）")
+    history = []
     while True:
         q = input("\n你：")
         if q in ("exit", "quit"):
             break
-        if rewrite:
-            rq = rewrite_query(q)
-            print(f"改写：{q} → {rq}" if rq != q else f"（{q[:12]}… 未改写：规范问法或改写回落）")
-            docs = retrieve_docs(rq, mode=mode)
-        else:
-            docs = retrieve_docs(q, mode=mode)
-        print("助手：", clean_citations(generate_from_docs(q, docs), docs))
+        rq = resolve_with_history(q, history)
+        if rq != q:
+            print(f"消解：{q} → {rq}")
+        docs = retrieve_docs(rq, mode=mode)
+        ans = clean_citations(generate_from_docs(q, docs, history=history), docs)
+        print("助手：", ans)
+        history.append(("user", q))
+        history.append(("assistant", ans))

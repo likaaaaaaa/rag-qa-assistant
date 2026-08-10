@@ -1,7 +1,7 @@
 import os
 import time
 import streamlit as st
-from rag import retrieve_docs, generate_from_docs, rewrite_query, clean_citations
+from rag import retrieve_docs, generate_from_docs, clean_citations, resolve_with_history
 
 
 st.set_page_config(page_title="AI 面试题库 · RAG 智能问答", page_icon="🤖")
@@ -29,6 +29,16 @@ for role, text in st.session_state.msgs:
     st.chat_message(role).write(text)
 
 # ============ 新问题处理 ============
+def recent_history(msgs, rounds=4):
+    """取最近 rounds 轮对话做历史（助手消息去掉耗时头，供消解与生成注入）"""
+    out = []
+    for role, text in msgs[-(rounds * 2):]:
+        if role == "assistant" and text.startswith("⚡"):
+            text = text.split("\n", 1)[1] if "\n" in text else ""
+        out.append((role, text))
+    return out
+
+
 if q := st.chat_input("输入你的问题…"):
     # 生成期间:占位容器显示"用户气泡 + 思考中",立即反馈不干等
     live = st.empty()
@@ -37,18 +47,21 @@ if q := st.chat_input("输入你的问题…"):
             st.write(q)
         with st.chat_message("assistant"):
             with st.spinner("思考中…"):
+                history = recent_history(st.session_state.msgs)
                 t0 = time.time()
-                rq = rewrite_query(q)  # 口语问题先改写，检索用改写后的
-                t_rewrite = time.time() - t0
+                rq = resolve_with_history(q, history)
+                t_resolve = time.time() - t0
                 t1 = time.time()
                 docs = retrieve_docs(rq, mode=mode)
                 t_retrieve = time.time() - t1
                 t2 = time.time()
-                ans = generate_from_docs(q, docs)  # 生成仍用原问题，不改用户意图
+                ans = generate_from_docs(q, docs, history=history)
                 t_generate = time.time() - t2
 
     ans = clean_citations(ans, docs)
-    head = f"⚡ 改写 {t_rewrite:.1f}s · 检索 {t_retrieve:.1f}s · 生成 {t_generate:.1f}s"
+    head = f"⚡ 消解 {t_resolve:.1f}s · 检索 {t_retrieve:.1f}s · 生成 {t_generate:.1f}s"
+    if rq != q:
+        head += f"  (消解: {rq})"
     full = f"{head}\n\n{ans}"
 
     # 写入历史 → 清空占位容器 → rerun 统一重建(消除灰影)
